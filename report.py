@@ -39,19 +39,14 @@ FINAL_COLUMNS = [
     "REQUESTED_EQUIPMEN",
 ]
 
-SEARCHABLE_COLUMNS = [
-    "BILL_NUMBER",
-    "DESTNAME",
-    "DESTINATION",
-    "DELIVER_BY",
-    "DELIVER_BY_END",
-    "PALLETS",
-    "PIECES",
-    "DESTPROV",
-    "POSTAL_CODE",
-    "DESTCITY",
-    "REQUESTED_EQUIPMEN",
-]
+SEARCHABLE_COLUMNS = FINAL_COLUMNS
+
+# TJX STORES
+TJX_PREFIXES = (
+    "WINNERS",
+    "HOMESENSE",
+    "MARSHALLS",
+)
 
 EXCLUDED_DESTNAME_PREFIXES_MAIN = (
     "WINNERS",
@@ -87,34 +82,24 @@ def load_csv(uploaded_file) -> pd.DataFrame:
 
 def parse_datetime_column(series: pd.Series) -> pd.Series:
     s = series.fillna("").astype(str).str.strip()
-
     parsed = pd.to_datetime(s, errors="coerce")
 
-    mask = parsed.isna() & s.ne("") & s.ne("nan") & s.ne("NaT")
+    mask = parsed.isna() & s.ne("")
     if mask.any():
         parsed.loc[mask] = pd.to_datetime(
             s.loc[mask],
             format="%m/%d/%Y %I:%M %p",
             errors="coerce"
         )
-
-    mask = parsed.isna() & s.ne("") & s.ne("nan") & s.ne("NaT")
-    if mask.any():
-        parsed.loc[mask] = pd.to_datetime(
-            s.loc[mask],
-            format="%m/%d/%Y %I:%M:%S %p",
-            errors="coerce"
-        )
-
     return parsed
 
 
 def clean_numeric_column(series: pd.Series) -> pd.Series:
     return pd.to_numeric(
         series.fillna("")
-              .astype(str)
-              .str.replace(",", "", regex=False)
-              .str.strip(),
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip(),
         errors="coerce"
     ).fillna(0)
 
@@ -122,39 +107,22 @@ def clean_numeric_column(series: pd.Series) -> pd.Series:
 def extract_canadian_postal(text: str) -> str:
     if pd.isna(text):
         return ""
-
     value = str(text).upper().strip()
     match = re.search(r"\b([A-Z]\d[A-Z])\s?(\d[A-Z]\d)\b", value)
-
     if match:
         return f"{match.group(1)} {match.group(2)}"
-
     return ""
 
 
 def extract_us_zip(text: str) -> str:
     if pd.isna(text):
         return ""
-
-    value = str(text).strip()
-    match = re.search(r"\b\d{5}(?:-\d{4})?\b", value)
-
-    if match:
-        return match.group(0)
-
-    return ""
+    match = re.search(r"\b\d{5}(?:-\d{4})?\b", str(text))
+    return match.group(0) if match else ""
 
 
 def extract_postal_code(text: str) -> str:
-    canadian = extract_canadian_postal(text)
-    if canadian:
-        return canadian
-
-    us_zip = extract_us_zip(text)
-    if us_zip:
-        return us_zip
-
-    return ""
+    return extract_canadian_postal(text) or extract_us_zip(text)
 
 
 def get_postal_code(row) -> str:
@@ -171,36 +139,12 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
 
     missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {', '.join(missing)}")
+        raise ValueError(f"Missing columns: {missing}")
 
-    cols_to_keep = REQUIRED_COLUMNS.copy()
-    for col in OPTIONAL_COLUMNS:
-        if col in df.columns:
-            cols_to_keep.append(col)
+    df = df[REQUIRED_COLUMNS + [c for c in OPTIONAL_COLUMNS if c in df.columns]]
 
-    df = df[cols_to_keep].copy()
-
-    text_cols = [
-        "BILL_NUMBER",
-        "DESTNAME",
-        "DESTINATION",
-        "DESTPROV",
-        "DESTCITY",
-        "REQUESTED_EQUIPMEN",
-        "DELIVER_BY",
-        "DELIVER_BY_END",
-    ]
-
-    for col in ["END_ZONE", "DESTZONE"]:
-        if col in df.columns:
-            text_cols.append(col)
-
-    for col in text_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna("").astype(str).str.strip()
-
-    df = df[~df["BILL_NUMBER"].str.upper().str.startswith("LB", na=False)].copy()
-    df = df[df["BILL_NUMBER"].ne("")].copy()
+    df = df[~df["BILL_NUMBER"].str.upper().str.startswith("LB", na=False)]
+    df = df[df["BILL_NUMBER"].ne("")]
 
     df["PIECES"] = clean_numeric_column(df["PIECES"])
     df["PALLETS"] = clean_numeric_column(df["PALLETS"])
@@ -210,122 +154,81 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
 
     df["POSTAL_CODE"] = df.apply(get_postal_code, axis=1)
 
-    df = df.drop_duplicates(subset=["BILL_NUMBER"], keep="first").copy()
+    df["SORT"] = df["DELIVER_BY_END_DT"].combine_first(df["DELIVER_BY_DT"])
 
-    df["SORT_DATETIME"] = df["DELIVER_BY_END_DT"].combine_first(df["DELIVER_BY_DT"])
-    df["SORT_POSTAL"] = df["POSTAL_CODE"].fillna("").astype(str).str.upper().str.strip()
-
-    df = df.sort_values(
-        by=["SORT_DATETIME", "DELIVER_BY_DT", "SORT_POSTAL", "BILL_NUMBER"],
-        ascending=[True, True, True, True],
-        na_position="last"
-    ).reset_index(drop=True)
+    df = df.sort_values(by=["SORT", "POSTAL_CODE", "BILL_NUMBER"])
 
     df["DELIVER_BY"] = df["DELIVER_BY_DT"].dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
     df["DELIVER_BY_END"] = df["DELIVER_BY_END_DT"].dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
 
-    final_df = df[FINAL_COLUMNS].copy()
-    return final_df
+    return df[FINAL_COLUMNS]
 
 
-def remove_main_excluded_destinations(df: pd.DataFrame) -> pd.DataFrame:
-    dest_upper = df["DESTNAME"].fillna("").astype(str).str.strip().str.upper()
-    mask_excluded = dest_upper.str.startswith(EXCLUDED_DESTNAME_PREFIXES_MAIN, na=False)
-    return df[~mask_excluded].copy()
+def is_tjx(name: str) -> bool:
+    if not name:
+        return False
+    return str(name).upper().startswith(TJX_PREFIXES)
 
 
-def remove_stokes_destinations(df: pd.DataFrame) -> pd.DataFrame:
-    dest_upper = df["DESTNAME"].fillna("").astype(str).str.strip().str.upper()
-    mask_excluded = dest_upper.str.startswith(EXCLUDED_DESTNAME_PREFIXES_STOKES, na=False)
-    return df[~mask_excluded].copy()
+def remove_tjx(df):
+    return df[~df["DESTNAME"].apply(is_tjx)].copy()
 
 
-def apply_search_filter(df: pd.DataFrame, selected_field: str, search_value: str) -> pd.DataFrame:
-    if not search_value or not selected_field:
+def keep_only_tjx(df):
+    return df[df["DESTNAME"].apply(is_tjx)].copy()
+
+
+def remove_stokes(df):
+    return df[~df["DESTNAME"].str.upper().str.startswith(EXCLUDED_DESTNAME_PREFIXES_STOKES)].copy()
+
+
+def search_filter(df, field, value):
+    if not value:
         return df
-
-    return df[
-        df[selected_field]
-        .fillna("")
-        .astype(str)
-        .str.contains(search_value, case=False, na=False)
-    ].copy()
-
-
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+    return df[df[field].astype(str).str.contains(value, case=False, na=False)]
 
 
 # =========================
 # UI
 # =========================
 st.title("🚚 Delivery Sorter")
-st.write(
-    "Upload your CSV file to extract deliveries, exclude bill numbers starting with LB, "
-    "detect postal codes, sort the deliveries, and search by any selected field."
-)
 
-uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
-if uploaded_file is not None:
-    try:
-        raw_df = load_csv(uploaded_file)
-        final_df = prepare_data(raw_df)
+if uploaded_file:
+    df = prepare_data(load_csv(uploaded_file))
 
-        st.subheader("Filters")
+    st.subheader("Filters")
 
-        filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1.4, 1.1, 1.1, 2])
+    col1, col2, col3, col4, col5 = st.columns([1.2, 1.2, 1.2, 1.2, 2])
 
-        remove_main_group = filter_col1.checkbox(
-            "Remove Winners / Homesense / Marshalls / Remco / Jerry Cohen",
-            value=False
-        )
+    remove_tjx_check = col1.checkbox("Remove TJX")
+    only_tjx_check = col2.checkbox("Show ONLY TJX")
+    remove_stokes_check = col3.checkbox("Remove Stokes")
 
-        remove_stokes = filter_col2.checkbox(
-            "Remove Stokes / Think Kitchen",
-            value=False
-        )
+    field = col4.selectbox("Field", SEARCHABLE_COLUMNS)
+    search = col5.text_input("Search")
 
-        selected_field = filter_col3.selectbox(
-            "Select a field",
-            SEARCHABLE_COLUMNS
-        )
+    working_df = df.copy()
 
-        search_value = filter_col4.text_input(
-            "Search value",
-            value="",
-            placeholder="Type to search..."
-        )
+    # PRIORITY LOGIC
+    if only_tjx_check:
+        working_df = keep_only_tjx(working_df)
+    elif remove_tjx_check:
+        working_df = remove_tjx(working_df)
 
-        working_df = final_df.copy()
+    if remove_stokes_check:
+        working_df = remove_stokes(working_df)
 
-        if remove_main_group:
-            working_df = remove_main_excluded_destinations(working_df)
+    working_df = search_filter(working_df, field, search)
 
-        if remove_stokes:
-            working_df = remove_stokes_destinations(working_df)
+    st.metric("Total Deliveries", len(working_df))
+    st.metric("Total Pallets", working_df["PALLETS"].sum())
 
-        filtered_df = apply_search_filter(working_df, selected_field, search_value)
+    st.dataframe(working_df, use_container_width=True)
 
-        st.success(f"File loaded successfully. {len(filtered_df)} delivery record(s) displayed.")
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Deliveries", len(filtered_df))
-        col2.metric("Total Pieces", int(filtered_df["PIECES"].sum()) if len(filtered_df) > 0 else 0)
-        col3.metric("Total Pallets", float(filtered_df["PALLETS"].sum()) if len(filtered_df) > 0 else 0.0)
-
-        st.subheader("Sorted Deliveries")
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
-
-        st.download_button(
-            label="📥 Download filtered CSV",
-            data=dataframe_to_csv_bytes(filtered_df),
-            file_name="sorted_deliveries.csv",
-            mime="text/csv",
-        )
-
-    except Exception as e:
-        st.error(f"Error: {e}")
-
-else:
-    st.info("Please upload a CSV file to begin.")
+    st.download_button(
+        "Download CSV",
+        working_df.to_csv(index=False).encode(),
+        "sorted.csv"
+    )
