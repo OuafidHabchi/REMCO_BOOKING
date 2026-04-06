@@ -1,6 +1,7 @@
 import re
 import streamlit as st
 import pandas as pd
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 
 st.set_page_config(page_title="Delivery Day Planner", page_icon="🚚", layout="wide")
 
@@ -44,7 +45,6 @@ EXCLUDED_DESTNAME_PREFIXES_STOKES = (
     "STOKES",
 )
 
-# ✅ AJOUTE ICI LES CUSTOMER NAMES À IGNORER
 IGNORED_CUSTOMER_NAMES = {
     "REMCO CANADIAN CONSOL",
     "HOMESENSE #025 REMCO DOCK",
@@ -76,26 +76,66 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_csv(uploaded_file) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception:
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, encoding="latin1")
-    return df
+    read_options = [
+        {"dtype": str},
+        {"encoding": "latin1", "dtype": str},
+        {"encoding": "cp1252", "dtype": str},
+    ]
+
+    last_error = None
+    for opts in read_options:
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, **opts)
+        except Exception as e:
+            last_error = e
+
+    raise last_error
+
+
+def parse_datetime_value(value):
+    if pd.isna(value):
+        return pd.NaT
+
+    s = str(value).strip()
+    if not s or s.upper() == "NAN":
+        return pd.NaT
+
+    s = re.sub(r"\s+", " ", s)
+
+    parsed = pd.to_datetime(s, errors="coerce")
+    if pd.notna(parsed):
+        return parsed
+
+    formats = [
+        "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M %p",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%d/%m/%Y %I:%M %p",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+    ]
+
+    for fmt in formats:
+        try:
+            return pd.to_datetime(s, format=fmt, errors="raise")
+        except Exception:
+            pass
+
+    return pd.NaT
 
 
 def parse_datetime_column(series: pd.Series) -> pd.Series:
-    s = series.fillna("").astype(str).str.strip()
-    parsed = pd.to_datetime(s, errors="coerce")
-
-    mask = parsed.isna() & s.ne("")
-    if mask.any():
-        parsed.loc[mask] = pd.to_datetime(
-            s.loc[mask],
-            format="%m/%d/%Y %I:%M %p",
-            errors="coerce"
-        )
-    return parsed
+    return series.apply(parse_datetime_value)
 
 
 def clean_numeric_column(series: pd.Series) -> pd.Series:
@@ -161,13 +201,6 @@ def compute_window_hours(start_dt, end_dt) -> float:
 
 
 def compute_priority_score(row) -> float:
-    """
-    Plus le score est petit, plus la livraison est prioritaire.
-    Logique :
-    - appointment requis = priorité plus haute
-    - fenêtre plus courte = priorité plus haute
-    - heure de fin plus tôt = priorité plus haute
-    """
     appt_req = str(row.get("DELIVERY_APPT_REQ_NORM", "")).upper() == "TRUE"
     deliver_by_dt = row.get("DELIVER_BY_DT")
     deliver_by_end_dt = row.get("DELIVER_BY_END_DT")
@@ -202,7 +235,6 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     df["DELIVER_BY_DT"] = parse_datetime_column(df["DELIVER_BY"])
     df["DELIVER_BY_END_DT"] = parse_datetime_column(df["DELIVER_BY_END"])
 
-    # Date utilisée pour sélection de journée
     df["PLANNING_DT"] = df["DELIVER_BY_DT"].combine_first(df["DELIVER_BY_END_DT"])
     df = df[df["PLANNING_DT"].notna()].copy()
     df["PLANNING_DATE"] = df["PLANNING_DT"].dt.date
@@ -257,29 +289,41 @@ def remove_ignored_customers(df: pd.DataFrame) -> pd.DataFrame:
     return df[~df["CUSTOMER_NAME"].apply(is_ignored_customer)].copy()
 
 
-def get_row_style(row):
-    """
-    Rouge si DELIVERY_APPT_REQ = TRUE et DELIVERY_APPT_MADE = FALSE
-    """
-    appt_req = str(row.get("DELIVERY_APPT_REQ", "")).upper() == "TRUE"
-    appt_made_false = str(row.get("DELIVERY_APPT_MADE", "")).upper() == "FALSE"
+# =========================
+# AGGRID STYLE
+# =========================
+cell_style_js = JsCode("""
+function(params) {
+    if (params.colDef.field === 'PLANNED') {
+        return {
+            'color': '#111111',
+            'fontWeight': 'normal',
+            'textAlign': 'center'
+        };
+    }
 
-    if appt_req and appt_made_false:
-        return "background-color: #ff4d4d; color: white; font-weight: 700;"
-    return ""
+    const req = String(params.data.DELIVERY_APPT_REQ || '').toUpperCase();
+    const made = String(params.data.DELIVERY_APPT_MADE || '').toUpperCase();
 
+    if (req === 'TRUE' && made === 'FALSE') {
+        return {
+            'color': '#d62828',
+            'fontWeight': '700'
+        };
+    }
 
-def build_styler(df: pd.DataFrame):
-    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    if (req === 'TRUE' && made === 'TRUE') {
+        return {
+            'color': '#2e8b57',
+            'fontWeight': '700'
+        };
+    }
 
-    for idx, row in df.iterrows():
-        row_style = get_row_style(row)
-        if row_style:
-            for col in df.columns:
-                if col != "PLANNED":
-                    styles.at[idx, col] = row_style
-
-    return df.style.apply(lambda _: styles, axis=None)
+    return {
+        'color': '#111111'
+    };
+}
+""")
 
 
 # =========================
@@ -316,7 +360,6 @@ if uploaded_file:
         only_tjx_check = col2.checkbox("Show ONLY TJX")
         remove_stokes_check = col3.checkbox("Remove Stokes")
 
-        # Ignore custom customer names
         working_df = remove_ignored_customers(working_df)
 
         if only_tjx_check:
@@ -327,17 +370,37 @@ if uploaded_file:
         if remove_stokes_check:
             working_df = remove_stokes(working_df)
 
-        # TRI FINAL
         working_df = working_df.sort_values(
             by=["PRIORITY_SCORE", "WINDOW_HOURS", "DELIVER_BY_END_DT", "DELIVER_BY_DT", "BILL_NUMBER"],
             ascending=[True, True, True, True, True]
         ).reset_index(drop=True)
 
-        st.subheader("3) Daily planning view")
+        state_key = f"planned_map_{selected_date}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = {}
+
+        display_columns = [col for col in DISPLAY_COLUMNS_PRIORITY if col in working_df.columns]
+        display_df = working_df[display_columns].copy()
+
+        if "DELIVERY_APPT_REQ_NORM" in working_df.columns:
+            display_df["DELIVERY_APPT_REQ"] = working_df["DELIVERY_APPT_REQ_NORM"].values
+
+        bill_numbers = working_df["BILL_NUMBER"].astype(str).tolist()
+        saved_map = st.session_state[state_key]
+
+        planned_values = []
+        for bill in bill_numbers:
+            planned_values.append(bool(saved_map.get(bill, False)))
+
+        if "PLANNED" not in display_df.columns:
+            display_df.insert(0, "PLANNED", planned_values)
+        else:
+            display_df["PLANNED"] = planned_values
 
         total_deliveries = len(working_df)
         total_pallets = working_df["ROLLUP_PALLETS"].sum() if "ROLLUP_PALLETS" in working_df.columns else 0
         total_pieces = working_df["ROLLUP_PIECES"].sum() if "ROLLUP_PIECES" in working_df.columns else 0
+
         total_red = (
             (
                 (working_df["DELIVERY_APPT_REQ_NORM"].astype(str).str.upper() == "TRUE") &
@@ -346,62 +409,93 @@ if uploaded_file:
             if "DELIVERY_APPT_REQ_NORM" in working_df.columns and "DELIVERY_APPT_MADE" in working_df.columns
             else 0
         )
-        total_planned = st.session_state.get(f"planned_count_{selected_date}", 0)
 
-        m1, m2, m3, m4, m5 = st.columns(5)
+        total_green = (
+            (
+                (working_df["DELIVERY_APPT_REQ_NORM"].astype(str).str.upper() == "TRUE") &
+                (working_df["DELIVERY_APPT_MADE"].astype(str).str.upper() == "TRUE")
+            ).sum()
+            if "DELIVERY_APPT_REQ_NORM" in working_df.columns and "DELIVERY_APPT_MADE" in working_df.columns
+            else 0
+        )
+
+        planned_count_before = int(display_df["PLANNED"].astype(bool).sum()) if "PLANNED" in display_df.columns else 0
+
+        st.subheader("3) Daily planning summary")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Total Deliveries", total_deliveries)
         m2.metric("Total Pallets", f"{total_pallets:,.0f}")
         m3.metric("Total Pieces", f"{total_pieces:,.0f}")
-        m4.metric("Appt Req TRUE / Made FALSE", int(total_red))
-        m5.metric("Planned", int(total_planned))
+        m4.metric("Appt Missing", int(total_red))
+        m5.metric("Appt Done", int(total_green))
+        m6.metric("Planned", int(planned_count_before))
 
-        display_columns = [col for col in DISPLAY_COLUMNS_PRIORITY if col in working_df.columns]
-        display_df = working_df[display_columns].copy()
+        st.markdown(f"**Bills déjà planifiés : {planned_count_before} / {len(display_df)}**")
 
-        if "DELIVERY_APPT_REQ_NORM" in working_df.columns:
-            display_df["DELIVERY_APPT_REQ"] = working_df["DELIVERY_APPT_REQ_NORM"].values
+        st.subheader("4) Daily planning view")
 
-        # ✅ Colonne checkbox au début
-        if "PLANNED" not in display_df.columns:
-            display_df.insert(0, "PLANNED", False)
-        else:
-            display_df["PLANNED"] = display_df["PLANNED"].fillna(False).astype(bool)
-
-        editor_key = f"delivery_editor_{selected_date}"
-
-        edited_df = st.data_editor(
-            display_df,
-            use_container_width=True,
-            height=650,
-            hide_index=True,
-            key=editor_key,
-            column_config={
-                "PLANNED": st.column_config.CheckboxColumn(
-                    "PLANNED",
-                    help="Coche si cette livraison est déjà planifiée",
-                    default=False,
-                )
-            },
-            disabled=[col for col in display_df.columns if col != "PLANNED"],
+        gb = GridOptionsBuilder.from_dataframe(display_df)
+        gb.configure_default_column(
+            editable=False,
+            filter=True,
+            sortable=True,
+            resizable=True,
+            cellStyle=cell_style_js,
         )
 
-        planned_count = int(edited_df["PLANNED"].sum()) if "PLANNED" in edited_df.columns else 0
-        st.session_state[f"planned_count_{selected_date}"] = planned_count
+        gb.configure_column(
+            "PLANNED",
+            headerName="PLANNED",
+            editable=True,
+            cellEditor="agCheckboxCellEditor",
+            cellRenderer="agCheckboxCellRenderer",
+            width=110,
+            pinned="left",
+            cellStyle=JsCode("""
+            function(params) {
+                return {
+                    'textAlign': 'center'
+                };
+            }
+            """),
+        )
 
-        st.markdown(f"**Bills déjà planifiés : {planned_count} / {len(edited_df)}**")
+        for col in display_df.columns:
+            if col != "PLANNED":
+                gb.configure_column(col, cellStyle=cell_style_js)
 
-        # ✅ Petit tableau rouge/normal avec checkbox gardée
-        styled_preview = build_styler(edited_df)
+        gb.configure_grid_options(
+            rowSelection="single",
+            suppressRowClickSelection=True,
+            domLayout="normal",
+        )
 
-        with st.expander("Preview with alert colors"):
-            st.dataframe(
-                styled_preview,
-                use_container_width=True,
-                height=500
-            )
+        grid_options = gb.build()
+
+        grid_response = AgGrid(
+            display_df,
+            gridOptions=grid_options,
+            data_return_mode=DataReturnMode.AS_INPUT,
+            update_mode=GridUpdateMode.VALUE_CHANGED,
+            fit_columns_on_grid_load=False,
+            allow_unsafe_jscode=True,
+            enable_enterprise_modules=False,
+            height=650,
+            theme="streamlit",
+            reload_data=False,
+        )
+
+        edited_df = pd.DataFrame(grid_response["data"])
+
+        updated_map = {}
+        for _, row in edited_df.iterrows():
+            bill = str(row["BILL_NUMBER"])
+            updated_map[bill] = bool(row["PLANNED"])
+
+        st.session_state[state_key] = updated_map
 
         export_df = working_df.copy()
-        export_df.insert(0, "PLANNED", edited_df["PLANNED"].values)
+        export_df.insert(0, "PLANNED", edited_df["PLANNED"].astype(bool).values)
 
         csv_export = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
