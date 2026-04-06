@@ -2,66 +2,70 @@ import re
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="Delivery Sorter", page_icon="🚚", layout="wide")
+st.set_page_config(page_title="Delivery Day Planner", page_icon="🚚", layout="wide")
 
 # =========================
 # CONFIG
 # =========================
 REQUIRED_COLUMNS = [
     "BILL_NUMBER",
-    "DESTNAME",
-    "DESTINATION",
+    "DELIVERY_APPT_REQ",
     "DELIVER_BY",
     "DELIVER_BY_END",
-    "PALLETS",
-    "PIECES",
-    "DESTPROV",
-    "DESTCITY",
-    "REQUESTED_EQUIPMEN",
 ]
 
 OPTIONAL_COLUMNS = [
-    "END_ZONE",
-    "DESTZONE",
+    "CURRENT_STATUS",
+    "DELIVERY_APPT_MADE",
+    "CARE_OF_NAME",
+    "CARE_OF_ADDR1",
+    "CARE_OF_CITY",
+    "CARE_OF_ADDR2",
+    "CARE_OF_PROV",
+    "CARE_OF_PC",
+    "ROLLUP_PIECES",
+    "ROLLUP_PALLETS",
+    "COMMODITY",
+    "ROLLUP_CUBE",
+    "ROLLUP_WEIGHT",
+    "ROUTE_DESIGNATION",
+    "LATEST_PICK_UP_BY",
+    "CONSIGNEE_AVG_DWELL_TIME",
 ]
 
-FINAL_COLUMNS = [
-    "BILL_NUMBER",
-    "DESTNAME",
-    "DESTINATION",
-    "DELIVER_BY",
-    "DELIVER_BY_END",
-    "PALLETS",
-    "PIECES",
-    "DESTPROV",
-    "POSTAL_CODE",
-    "DESTCITY",
-    "REQUESTED_EQUIPMEN",
-]
-
-SEARCHABLE_COLUMNS = FINAL_COLUMNS
-
-# TJX STORES
 TJX_PREFIXES = (
     "WINNERS",
     "HOMESENSE",
     "MARSHALLS",
 )
 
-EXCLUDED_DESTNAME_PREFIXES_MAIN = (
-    "WINNERS",
-    "HOMESENSE",
-    "MARSHALLS",
-    "REMCO CANADIAN CONSOL",
-    "JERRY COHEN FORWARDERS LTD",
-    "REMCO CANADAIAN CONSOL",
-    "MTL FREIGHT",
-)
-
 EXCLUDED_DESTNAME_PREFIXES_STOKES = (
     "THINK KITCHEN",
     "STOKES",
 )
+
+# ✅ AJOUTE ICI LES CUSTOMER NAMES À IGNORER
+IGNORED_CUSTOMER_NAMES = {
+    "REMCO CANADIAN CONSOL",
+    "HOMESENSE #025 REMCO DOCK",
+    "WINNERS (20) REMCO DOCK",
+}
+
+DISPLAY_COLUMNS_PRIORITY = [
+    "PLANNED",
+    "BILL_NUMBER",
+    "CURRENT_STATUS",
+    "CUSTOMER_NAME",
+    "DELIVERY_APPT_REQ",
+    "DELIVERY_APPT_MADE",
+    "DELIVER_BY",
+    "DELIVER_BY_END",
+    "ROLLUP_PALLETS",
+    "ROLLUP_PIECES",
+    "CARE_OF_CITY",
+    "CARE_OF_PROV",
+    "CARE_OF_PC",
+]
 
 # =========================
 # HELPERS
@@ -104,34 +108,81 @@ def clean_numeric_column(series: pd.Series) -> pd.Series:
     ).fillna(0)
 
 
-def extract_canadian_postal(text: str) -> str:
-    if pd.isna(text):
+def normalize_bool_text(value) -> str:
+    if pd.isna(value):
         return ""
-    value = str(text).upper().strip()
-    match = re.search(r"\b([A-Z]\d[A-Z])\s?(\d[A-Z]\d)\b", value)
-    if match:
-        return f"{match.group(1)} {match.group(2)}"
-    return ""
+    v = str(value).strip().lower()
+    if v in ["true", "yes", "y", "1"]:
+        return "TRUE"
+    if v in ["false", "no", "n", "0"]:
+        return "FALSE"
+    return str(value).strip().upper()
 
 
-def extract_us_zip(text: str) -> str:
-    if pd.isna(text):
+def normalize_name(value) -> str:
+    if pd.isna(value):
         return ""
-    match = re.search(r"\b\d{5}(?:-\d{4})?\b", str(text))
-    return match.group(0) if match else ""
+    return str(value).strip().upper()
 
 
-def extract_postal_code(text: str) -> str:
-    return extract_canadian_postal(text) or extract_us_zip(text)
-
-
-def get_postal_code(row) -> str:
-    for col in ["END_ZONE", "DESTZONE", "DESTINATION", "DESTNAME"]:
+def get_customer_name(row) -> str:
+    for col in ["CARE_OF_NAME", "DESTNAME", "CUSTOMER_NAME", "CONSIGNEE", "SHIP_TO_NAME"]:
         if col in row.index:
-            postal = extract_postal_code(row.get(col, ""))
-            if postal:
-                return postal
+            val = str(row.get(col, "")).strip()
+            if val and val.upper() != "NAN":
+                return val
     return ""
+
+
+def is_tjx(name: str) -> bool:
+    if not name:
+        return False
+    return str(name).upper().startswith(TJX_PREFIXES)
+
+
+def is_stokes(name: str) -> bool:
+    if not name:
+        return False
+    return str(name).upper().startswith(EXCLUDED_DESTNAME_PREFIXES_STOKES)
+
+
+def is_ignored_customer(name: str) -> bool:
+    if not name:
+        return False
+    ignored = {normalize_name(x) for x in IGNORED_CUSTOMER_NAMES}
+    return normalize_name(name) in ignored
+
+
+def compute_window_hours(start_dt, end_dt) -> float:
+    if pd.notna(start_dt) and pd.notna(end_dt):
+        hours = (end_dt - start_dt).total_seconds() / 3600
+        return round(max(hours, 0), 2)
+    return 9999.0
+
+
+def compute_priority_score(row) -> float:
+    """
+    Plus le score est petit, plus la livraison est prioritaire.
+    Logique :
+    - appointment requis = priorité plus haute
+    - fenêtre plus courte = priorité plus haute
+    - heure de fin plus tôt = priorité plus haute
+    """
+    appt_req = str(row.get("DELIVERY_APPT_REQ_NORM", "")).upper() == "TRUE"
+    deliver_by_dt = row.get("DELIVER_BY_DT")
+    deliver_by_end_dt = row.get("DELIVER_BY_END_DT")
+    window_hours = row.get("WINDOW_HOURS", 9999.0)
+
+    base = 0 if appt_req else 100000
+
+    if pd.notna(deliver_by_end_dt):
+        end_value = deliver_by_end_dt.timestamp()
+    elif pd.notna(deliver_by_dt):
+        end_value = deliver_by_dt.timestamp()
+    else:
+        end_value = 9999999999
+
+    return base + (window_hours * 1000) + end_value
 
 
 def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -141,94 +192,224 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing columns: {missing}")
 
-    df = df[REQUIRED_COLUMNS + [c for c in OPTIONAL_COLUMNS if c in df.columns]]
+    keep_cols = list(dict.fromkeys(REQUIRED_COLUMNS + OPTIONAL_COLUMNS + list(df.columns)))
+    df = df[[c for c in keep_cols if c in df.columns]].copy()
 
-    df = df[~df["BILL_NUMBER"].str.upper().str.startswith("LB", na=False)]
+    df["BILL_NUMBER"] = df["BILL_NUMBER"].fillna("").astype(str).str.strip()
     df = df[df["BILL_NUMBER"].ne("")]
-
-    df["PIECES"] = clean_numeric_column(df["PIECES"])
-    df["PALLETS"] = clean_numeric_column(df["PALLETS"])
+    df = df[~df["BILL_NUMBER"].str.upper().str.startswith("LB", na=False)]
 
     df["DELIVER_BY_DT"] = parse_datetime_column(df["DELIVER_BY"])
     df["DELIVER_BY_END_DT"] = parse_datetime_column(df["DELIVER_BY_END"])
 
-    df["POSTAL_CODE"] = df.apply(get_postal_code, axis=1)
+    # Date utilisée pour sélection de journée
+    df["PLANNING_DT"] = df["DELIVER_BY_DT"].combine_first(df["DELIVER_BY_END_DT"])
+    df = df[df["PLANNING_DT"].notna()].copy()
+    df["PLANNING_DATE"] = df["PLANNING_DT"].dt.date
 
-    df["SORT"] = df["DELIVER_BY_END_DT"].combine_first(df["DELIVER_BY_DT"])
+    if "ROLLUP_PIECES" in df.columns:
+        df["ROLLUP_PIECES"] = clean_numeric_column(df["ROLLUP_PIECES"])
+    else:
+        df["ROLLUP_PIECES"] = 0
 
-    df = df.sort_values(by=["SORT", "POSTAL_CODE", "BILL_NUMBER"])
+    if "ROLLUP_PALLETS" in df.columns:
+        df["ROLLUP_PALLETS"] = clean_numeric_column(df["ROLLUP_PALLETS"])
+    else:
+        df["ROLLUP_PALLETS"] = 0
+
+    df["DELIVERY_APPT_REQ_NORM"] = df["DELIVERY_APPT_REQ"].apply(normalize_bool_text)
+
+    if "DELIVERY_APPT_MADE" in df.columns:
+        df["DELIVERY_APPT_MADE"] = df["DELIVERY_APPT_MADE"].apply(normalize_bool_text)
+    else:
+        df["DELIVERY_APPT_MADE"] = ""
+
+    if "CURRENT_STATUS" not in df.columns:
+        df["CURRENT_STATUS"] = ""
+
+    df["CUSTOMER_NAME"] = df.apply(get_customer_name, axis=1)
+
+    df["WINDOW_HOURS"] = df.apply(
+        lambda row: compute_window_hours(row["DELIVER_BY_DT"], row["DELIVER_BY_END_DT"]),
+        axis=1
+    )
+    df["PRIORITY_SCORE"] = df.apply(compute_priority_score, axis=1)
 
     df["DELIVER_BY"] = df["DELIVER_BY_DT"].dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
     df["DELIVER_BY_END"] = df["DELIVER_BY_END_DT"].dt.strftime("%Y-%m-%d %I:%M %p").fillna("")
 
-    return df[FINAL_COLUMNS]
+    return df
 
 
-def is_tjx(name: str) -> bool:
-    if not name:
-        return False
-    return str(name).upper().startswith(TJX_PREFIXES)
+def remove_tjx(df: pd.DataFrame) -> pd.DataFrame:
+    return df[~df["CUSTOMER_NAME"].apply(is_tjx)].copy()
 
 
-def remove_tjx(df):
-    return df[~df["DESTNAME"].apply(is_tjx)].copy()
+def keep_only_tjx(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df["CUSTOMER_NAME"].apply(is_tjx)].copy()
 
 
-def keep_only_tjx(df):
-    return df[df["DESTNAME"].apply(is_tjx)].copy()
+def remove_stokes(df: pd.DataFrame) -> pd.DataFrame:
+    return df[~df["CUSTOMER_NAME"].apply(is_stokes)].copy()
 
 
-def remove_stokes(df):
-    return df[~df["DESTNAME"].str.upper().str.startswith(EXCLUDED_DESTNAME_PREFIXES_STOKES)].copy()
+def remove_ignored_customers(df: pd.DataFrame) -> pd.DataFrame:
+    return df[~df["CUSTOMER_NAME"].apply(is_ignored_customer)].copy()
 
 
-def search_filter(df, field, value):
-    if not value:
-        return df
-    return df[df[field].astype(str).str.contains(value, case=False, na=False)]
+def get_row_style(row):
+    """
+    Rouge si DELIVERY_APPT_REQ = TRUE et DELIVERY_APPT_MADE = FALSE
+    """
+    appt_req = str(row.get("DELIVERY_APPT_REQ", "")).upper() == "TRUE"
+    appt_made_false = str(row.get("DELIVERY_APPT_MADE", "")).upper() == "FALSE"
+
+    if appt_req and appt_made_false:
+        return "background-color: #ff4d4d; color: white; font-weight: 700;"
+    return ""
+
+
+def build_styler(df: pd.DataFrame):
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+
+    for idx, row in df.iterrows():
+        row_style = get_row_style(row)
+        if row_style:
+            for col in df.columns:
+                if col != "PLANNED":
+                    styles.at[idx, col] = row_style
+
+    return df.style.apply(lambda _: styles, axis=None)
 
 
 # =========================
 # UI
 # =========================
-st.title("🚚 Delivery Sorter")
+st.title("🚚 Delivery Day Planner")
 
 uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded_file:
-    df = prepare_data(load_csv(uploaded_file))
+    try:
+        raw_df = load_csv(uploaded_file)
+        df = prepare_data(raw_df)
 
-    st.subheader("Filters")
+        available_dates = sorted(df["PLANNING_DATE"].dropna().unique())
 
-    col1, col2, col3, col4, col5 = st.columns([1.2, 1.2, 1.2, 1.2, 2])
+        if not available_dates:
+            st.warning("Aucune date valide trouvée dans le fichier.")
+            st.stop()
 
-    remove_tjx_check = col1.checkbox("Remove TJX")
-    only_tjx_check = col2.checkbox("Show ONLY TJX")
-    remove_stokes_check = col3.checkbox("Remove Stokes")
+        st.subheader("1) Select a delivery date")
+        selected_date = st.selectbox(
+            "Dates found in the file",
+            available_dates,
+            format_func=lambda x: x.strftime("%Y-%m-%d")
+        )
 
-    field = col4.selectbox("Field", SEARCHABLE_COLUMNS)
-    search = col5.text_input("Search")
+        working_df = df[df["PLANNING_DATE"] == selected_date].copy()
 
-    working_df = df.copy()
+        st.subheader("2) Filters")
+        col1, col2, col3 = st.columns(3)
 
-    # PRIORITY LOGIC
-    if only_tjx_check:
-        working_df = keep_only_tjx(working_df)
-    elif remove_tjx_check:
-        working_df = remove_tjx(working_df)
+        remove_tjx_check = col1.checkbox("Remove TJX")
+        only_tjx_check = col2.checkbox("Show ONLY TJX")
+        remove_stokes_check = col3.checkbox("Remove Stokes")
 
-    if remove_stokes_check:
-        working_df = remove_stokes(working_df)
+        # Ignore custom customer names
+        working_df = remove_ignored_customers(working_df)
 
-    working_df = search_filter(working_df, field, search)
+        if only_tjx_check:
+            working_df = keep_only_tjx(working_df)
+        elif remove_tjx_check:
+            working_df = remove_tjx(working_df)
 
-    st.metric("Total Deliveries", len(working_df))
-    st.metric("Total Pallets", working_df["PALLETS"].sum())
+        if remove_stokes_check:
+            working_df = remove_stokes(working_df)
 
-    st.dataframe(working_df, use_container_width=True)
+        # TRI FINAL
+        working_df = working_df.sort_values(
+            by=["PRIORITY_SCORE", "WINDOW_HOURS", "DELIVER_BY_END_DT", "DELIVER_BY_DT", "BILL_NUMBER"],
+            ascending=[True, True, True, True, True]
+        ).reset_index(drop=True)
 
-    st.download_button(
-        "Download CSV",
-        working_df.to_csv(index=False).encode(),
-        "sorted.csv"
-    )
+        st.subheader("3) Daily planning view")
+
+        total_deliveries = len(working_df)
+        total_pallets = working_df["ROLLUP_PALLETS"].sum() if "ROLLUP_PALLETS" in working_df.columns else 0
+        total_pieces = working_df["ROLLUP_PIECES"].sum() if "ROLLUP_PIECES" in working_df.columns else 0
+        total_red = (
+            (
+                (working_df["DELIVERY_APPT_REQ_NORM"].astype(str).str.upper() == "TRUE") &
+                (working_df["DELIVERY_APPT_MADE"].astype(str).str.upper() == "FALSE")
+            ).sum()
+            if "DELIVERY_APPT_REQ_NORM" in working_df.columns and "DELIVERY_APPT_MADE" in working_df.columns
+            else 0
+        )
+        total_planned = st.session_state.get(f"planned_count_{selected_date}", 0)
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Deliveries", total_deliveries)
+        m2.metric("Total Pallets", f"{total_pallets:,.0f}")
+        m3.metric("Total Pieces", f"{total_pieces:,.0f}")
+        m4.metric("Appt Req TRUE / Made FALSE", int(total_red))
+        m5.metric("Planned", int(total_planned))
+
+        display_columns = [col for col in DISPLAY_COLUMNS_PRIORITY if col in working_df.columns]
+        display_df = working_df[display_columns].copy()
+
+        if "DELIVERY_APPT_REQ_NORM" in working_df.columns:
+            display_df["DELIVERY_APPT_REQ"] = working_df["DELIVERY_APPT_REQ_NORM"].values
+
+        # ✅ Colonne checkbox au début
+        if "PLANNED" not in display_df.columns:
+            display_df.insert(0, "PLANNED", False)
+        else:
+            display_df["PLANNED"] = display_df["PLANNED"].fillna(False).astype(bool)
+
+        editor_key = f"delivery_editor_{selected_date}"
+
+        edited_df = st.data_editor(
+            display_df,
+            use_container_width=True,
+            height=650,
+            hide_index=True,
+            key=editor_key,
+            column_config={
+                "PLANNED": st.column_config.CheckboxColumn(
+                    "PLANNED",
+                    help="Coche si cette livraison est déjà planifiée",
+                    default=False,
+                )
+            },
+            disabled=[col for col in display_df.columns if col != "PLANNED"],
+        )
+
+        planned_count = int(edited_df["PLANNED"].sum()) if "PLANNED" in edited_df.columns else 0
+        st.session_state[f"planned_count_{selected_date}"] = planned_count
+
+        st.markdown(f"**Bills déjà planifiés : {planned_count} / {len(edited_df)}**")
+
+        # ✅ Petit tableau rouge/normal avec checkbox gardée
+        styled_preview = build_styler(edited_df)
+
+        with st.expander("Preview with alert colors"):
+            st.dataframe(
+                styled_preview,
+                use_container_width=True,
+                height=500
+            )
+
+        export_df = working_df.copy()
+        export_df.insert(0, "PLANNED", edited_df["PLANNED"].values)
+
+        csv_export = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download filtered day CSV",
+            csv_export,
+            file_name=f"delivery_plan_{selected_date}.csv",
+            mime="text/csv"
+        )
+
+    except Exception as e:
+        st.error(f"Erreur: {e}")
