@@ -1,7 +1,7 @@
 import re
 import streamlit as st
 import pandas as pd
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, DataReturnMode, JsCode
 
 st.set_page_config(page_title="Delivery Day Planner", page_icon="🚚", layout="wide")
 
@@ -325,6 +325,14 @@ function(params) {
 }
 """)
 
+planned_cell_style_js = JsCode("""
+function(params) {
+    return {
+        'textAlign': 'center'
+    };
+}
+""")
+
 
 # =========================
 # UI
@@ -388,9 +396,7 @@ if uploaded_file:
         bill_numbers = working_df["BILL_NUMBER"].astype(str).tolist()
         saved_map = st.session_state[state_key]
 
-        planned_values = []
-        for bill in bill_numbers:
-            planned_values.append(bool(saved_map.get(bill, False)))
+        planned_values = [bool(saved_map.get(bill, False)) for bill in bill_numbers]
 
         if "PLANNED" not in display_df.columns:
             display_df.insert(0, "PLANNED", planned_values)
@@ -451,13 +457,7 @@ if uploaded_file:
             cellRenderer="agCheckboxCellRenderer",
             width=110,
             pinned="left",
-            cellStyle=JsCode("""
-            function(params) {
-                return {
-                    'textAlign': 'center'
-                };
-            }
-            """),
+            cellStyle=planned_cell_style_js,
         )
 
         for col in display_df.columns:
@@ -476,16 +476,20 @@ if uploaded_file:
             display_df,
             gridOptions=grid_options,
             data_return_mode=DataReturnMode.AS_INPUT,
-            update_mode=GridUpdateMode.VALUE_CHANGED,
+            update_on=["cellValueChanged"],
             fit_columns_on_grid_load=False,
             allow_unsafe_jscode=True,
             enable_enterprise_modules=False,
             height=650,
             theme="streamlit",
-            reload_data=False,
+            key=f"aggrid_{selected_date}",
         )
 
-        edited_df = pd.DataFrame(grid_response["data"])
+        grid_data = grid_response.get("data", display_df)
+        edited_df = pd.DataFrame(grid_data)
+
+        if edited_df.empty:
+            edited_df = display_df.copy()
 
         updated_map = {}
         for _, row in edited_df.iterrows():
